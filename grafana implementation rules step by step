@@ -1,0 +1,87 @@
+{{ define "teams-clean" }}
+{{ if gt (len .Alerts.Firing) 0 }}-- POD ALERTS - FIRING ({{ len .Alerts.Firing }}) --
+
+{{ range .Alerts.Firing }}--- Alert ---
+- Pod       : {{ .Labels.pod }}
+- Error     : {{ if .Labels.reason }}{{ .Labels.reason }}{{ else }}{{ .Labels.phase }}{{ end }}
+- Namespace : {{ .Labels.namespace }}
+- Node      : {{ .Labels.node }}
+- Source    : [View Alert]({{ .GeneratorURL }})
+
+{{ end }}{{ end }}{{ end }}
+_____________________________________________________________________________________________________________________
+
+(
+  kube_pod_container_status_waiting_reason{
+    reason=~"CrashLoopBackOff|ImagePullBackOff|ErrImagePull|CreateContainerConfigError|Error|ContainerCreating|InvalidImageName|CreateContainerError"
+  } == 1
+) * on(namespace, pod) group_left(node) kube_pod_info
+
+or
+
+(
+  kube_pod_container_status_last_terminated_reason{
+    reason=~"OOMKilled|Evicted"
+  } == 1
+  unless on(namespace, pod)
+  kube_pod_container_status_waiting_reason{
+    reason=~"CrashLoopBackOff|Error"
+  } == 1
+) * on(namespace, pod) group_left(node) kube_pod_info
+
+or
+
+(
+  kube_pod_status_phase{phase=~"Failed|Unknown"} == 1
+  unless on(namespace, pod)
+  kube_pod_container_status_waiting_reason == 1
+) * on(namespace, pod) group_left(node) kube_pod_info
+
+or
+
+(
+  increase(kube_pod_container_status_restarts_total[5m]) > bool 2
+  unless on(namespace, pod)
+  kube_pod_container_status_waiting_reason == 1
+) * on(namespace, pod) group_left(node) kube_pod_info
+
+or
+
+(
+  kube_pod_status_unschedulable == 1
+) * on(namespace, pod) group_left(node) kube_pod_info
+
+____________________________________________________________________________________________________________________________________________________
+
+
+
+
+Query — Only 1 Thing to Check
+Run this in Grafana Explore to verify your cluster has these metrics:
+promqlkube_pod_info
+promqlkube_pod_container_status_waiting_reason
+promqlkube_state_metrics_build_info
+If all return data → query works as-is ✅
+
+Only Change Needed — Grafana Root URL
+yaml# In your helm values.yaml
+grafana.ini:
+  server:
+    root_url: http://<YOUR-LOADBALANCER-URL>:3000
+This fixes the localhost in Source URL to your real URL.
+
+Final Checklist Before Going Live
+ItemStatusActionTemplate✅ ReadyCopy as-isPromQL Query✅ ReadyCopy as-isContact Point✅ ReadyAdd {{ template "teams-clean" . }} in messageTeams Webhook URL⚠️ CheckMake sure org Teams webhook is setRoot URL⚠️ FixSet LoadBalancer URL in grafana.iniNotification Policy⚠️ CheckMake sure alert routes to Teams contact pointAlert Rule Interval⚠️ OptionalSet to 1m evaluate every, 5m pending period
+
+Zero Modifications to Query Needed Because
+✅ No hardcoded namespace  → works across ALL namespaces
+✅ No hardcoded pod name   → works for ALL pods
+✅ No hardcoded node       → works across ALL nodes
+✅ unless deduplication    → 1 alert per pod, no duplicates
+✅ All error types covered → CrashLoop, OOM, Evicted, Failed etc
+_________________________________________________________________________________________________________________________________________
+
+we need to modify in custom notification template in Grafana and crate name and set name in Grafana
+and we need to use our custom template in messages
+
+
