@@ -1,0 +1,615 @@
+#!/bin/bash
+
+# ============================================================
+#  K8s Full Cluster Report
+#  - CPU & Memory allocation for all pods
+#  - Deployment / ReplicaSet / StatefulSet listing
+#  - Pod ownership type mapping
+#  Works with: EKS, self-managed K8s on EC2
+#  Run locally with kubeconfig / AWS credentials configured
+# ============================================================
+
+# ---------- Colours ----------
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+MAGENTA='\033[0;35m'
+BLUE='\033[0;34m'
+BOLD='\033[1m'
+RESET='\033[0m'
+
+# ---------- Config ----------
+OUTPUT_DIR="./k8s_reports"
+TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
+CSV_RESOURCES="${OUTPUT_DIR}/resource_allocation_${TIMESTAMP}.csv"
+CSV_WORKLOADS="${OUTPUT_DIR}/workload_report_${TIMESTAMP}.csv"
+TXT_FILE="${OUTPUT_DIR}/full_report_${TIMESTAMP}.txt"
+TMP_TOP="/tmp/k8s_top_$$.txt"
+TMP_PODS="/tmp/k8s_pods_$$.txt"
+TMP_DEPLOY="/tmp/k8s_deploy_$$.txt"
+TMP_RS="/tmp/k8s_rs_$$.txt"
+TMP_STS="/tmp/k8s_sts_$$.txt"
+TMP_POD_OWNER="/tmp/k8s_pod_owner_$$.txt"
+METRICS_AVAILABLE=false
+CURRENT_CONTEXT=""
+
+# ---------- Cleanup on exit ----------
+cleanup() {
+  rm -f "$TMP_TOP" "$TMP_PODS" "$TMP_DEPLOY" "$TMP_RS" "$TMP_STS" "$TMP_POD_OWNER"
+}
+trap cleanup EXIT
+
+# ---------- Helpers ----------
+log()     { echo -e "${CYAN}[INFO]${RESET}  $*"; }
+warn()    { echo -e "${YELLOW}[WARN]${RESET}  $*"; }
+err()     { echo -e "${RED}[ERROR]${RESET} $*" >&2; }
+section() {
+  local title="$1"
+  local SEP
+  SEP=$(printf '%.0s═' {1..100})
+  echo ""
+  echo -e "${BOLD}${CYAN}${SEP}${RESET}"
+  echo -e "${BOLD}${CYAN}  ${title}${RESET}"
+  echo -e "${BOLD}${CYAN}${SEP}${RESET}"
+  echo "$SEP"       >> "$TXT_FILE"
+  echo "  ${title}" >> "$TXT_FILE"
+  echo "$SEP"       >> "$TXT_FILE"
+}
+tee_txt() { echo -e "$*" | tee -a "$TXT_FILE"; }
+
+# ============================================================
+#  STEP 1 — Prerequisites
+# ============================================================
+check_prereqs() {
+  log "Checking prerequisites..."
+
+  for cmd in kubectl awk; do
+    if ! command -v "$cmd" &>/dev/null; then
+      err "'$cmd' is not installed or not in PATH. Please install it first."
+      exit 1
+    fi
+  done
+
+  if ! kubectl cluster-info &>/dev/null; then
+    err "Cannot reach the Kubernetes cluster."
+    err ""
+    err "  For EKS:"
+    err "    aws eks update-kubeconfig --region <region> --name <cluster-name>"
+    err ""
+    err "  For self-managed K8s:"
+    err "    export KUBECONFIG=/path/to/kubeconfig"
+    exit 1
+  fi
+
+  CURRENT_CONTEXT=$(kubectl config current-context 2>/dev/null || echo "unknown")
+  log "Connected to: ${BOLD}${CURRENT_CONTEXT}${RESET}"
+}
+
+# ============================================================
+#  STEP 2 — Node Summary
+# ============================================================
+print_node_summary() {
+  section "NODE SUMMARY"
+
+  echo -e "${BOLD}  ► All Nodes (wide)${RESET}"
+  kubectl get nodes -o wide 2>/dev/null \
+    | tee -a "$TXT_FILE" \
+    || warn "Could not list nodes."
+
+  echo ""
+  echo -e "${BOLD}  ► Node Allocatable Resources${RESET}"
+  kubectl get nodes --no-headers \
+    -o custom-columns=\
+'NAME:.metadata.name,CPU:.status.allocatable.cpu,MEMORY:.status.allocatable.memory,STATUS:.status.conditions[-1].type' \
+    2>/dev/null | tee -a "$TXT_FILE" \
+    || warn "Could not retrieve node allocatable resources."
+  echo ""
+}
+
+# ============================================================
+#  STEP 3 — Fetch live metrics (optional — needs Metrics Server)
+# ============================================================
+fetch_top_pods() {
+  if kubectl top pods --all-namespaces --no-headers > "$TMP_TOP" 2>/dev/null; then
+    METRICS_AVAILABLE=true
+    log "Metrics Server detected — live CPU/Memory usage will be included."
+  else
+    METRICS_AVAILABLE=false
+    warn "Metrics Server not available — showing REQUESTS/LIMITS only."
+    > "$TMP_TOP"
+  fi
+}
+
+# ---------- Helper: look up live usage for a pod ----------
+get_usage() {
+  local ns="$1" pod="$2"
+  local cpu="N/A" mem="N/A"
+  if [[ "$METRICS_AVAILABLE" == "true" ]]; then
+    local line
+    line=$(awk -v n="$ns" -v p="$pod" '$1==n && $2==p {print; exit}' "$TMP_TOP")
+    if [[ -n "$line" ]]; then
+      cpu=$(awk '{print $3}' <<< "$line")
+      mem=$(awk '{print $4}' <<< "$line")
+    fi
+  fi
+  echo "${cpu} ${mem}"
+}
+
+# ============================================================
+#  STEP 4 — Build pod → owner type mapping
+#           (Deployment / StatefulSet / ReplicaSet / DaemonSet / Job / standalone)
+# ============================================================
+build_pod_owner_map() {
+  log "Resolving pod owner types across all namespaces..."
+  > "$TMP_POD_OWNER"
+
+  # Get all pods with their ownerReferences
+  kubectl get pods --all-namespaces --no-headers \
+    -o custom-columns=\
+'NS:.metadata.namespace,NAME:.metadata.name,OWNER_KIND:.metadata.ownerReferences[0].kind,OWNER_NAME:.metadata.ownerReferences[0].name' \
+    2>/dev/null | while IFS= read -r line; do
+      [[ -z "$line" ]] && continue
+
+      NS=$(awk '{print $1}'   <<< "$line")
+      POD=$(awk '{print $2}'  <<< "$line")
+      OKIND=$(awk '{print $3}' <<< "$line")
+      ONAME=$(awk '{print $4}' <<< "$line")
+
+      # Normalise <none>
+      [[ "$OKIND" == "<none>" || -z "$OKIND" ]] && OKIND="Standalone"
+      [[ "$ONAME" == "<none>" || -z "$ONAME" ]] && ONAME=""
+
+      # If owner is a ReplicaSet, check whether that RS belongs to a Deployment
+      FINAL_TYPE="$OKIND"
+      if [[ "$OKIND" == "ReplicaSet" && -n "$ONAME" ]]; then
+        DEPLOY_OWNER=$(kubectl get replicaset "$ONAME" -n "$NS" \
+          -o jsonpath='{.metadata.ownerReferences[0].kind}' 2>/dev/null || echo "")
+        if [[ "$DEPLOY_OWNER" == "Deployment" ]]; then
+          FINAL_TYPE="Deployment"
+        else
+          FINAL_TYPE="ReplicaSet"
+        fi
+      fi
+
+      echo "${NS} ${POD} ${FINAL_TYPE}"
+    done > "$TMP_POD_OWNER"
+}
+
+# ---------- Helper: look up owner type for a pod ----------
+get_owner_type() {
+  local ns="$1" pod="$2"
+  awk -v n="$ns" -v p="$pod" '$1==n && $2==p {print $3; exit}' "$TMP_POD_OWNER" 2>/dev/null \
+    || echo "Unknown"
+}
+
+# ---------- Colour for workload type ----------
+type_colour() {
+  case "$1" in
+    Deployment)   echo "${BLUE}${1}${RESET}" ;;
+    StatefulSet)  echo "${MAGENTA}${1}${RESET}" ;;
+    ReplicaSet)   echo "${CYAN}${1}${RESET}" ;;
+    DaemonSet)    echo "${YELLOW}${1}${RESET}" ;;
+    Job|CronJob)  echo "${RED}${1}${RESET}" ;;
+    *)            echo "${1}" ;;
+  esac
+}
+
+# ============================================================
+#  STEP 5 — Resource Allocation Report (CPU / Memory)
+# ============================================================
+generate_resource_report() {
+  section "POD RESOURCE ALLOCATION (CPU & MEMORY)"
+
+  # CSV header
+  echo "NAMESPACE,POD_NAME,TYPE,NODE,STATUS,CPU_REQUEST,CPU_LIMIT,MEM_REQUEST,MEM_LIMIT,CPU_USAGE,MEM_USAGE" \
+    > "$CSV_RESOURCES"
+
+  local FMT='%-26s %-48s %-14s %-20s %-12s %-12s %-12s %-12s %-12s %-11s %-11s'
+  local SEP; SEP=$(printf '%.0s-' {1..196})
+
+  local HEADER
+  HEADER=$(printf "$FMT" \
+    'NAMESPACE' 'POD NAME' 'TYPE' 'NODE' 'STATUS' \
+    'CPU REQ' 'CPU LIMIT' 'MEM REQ' 'MEM LIMIT' \
+    'CPU USAGE' 'MEM USAGE')
+
+  echo -e "${BOLD}${HEADER}${RESET}"
+  echo -e "${BOLD}${SEP}${RESET}"
+  echo "$HEADER" >> "$TXT_FILE"
+  echo "$SEP"    >> "$TXT_FILE"
+
+  kubectl get pods --all-namespaces --no-headers \
+    -o custom-columns=\
+'NS:.metadata.namespace,NAME:.metadata.name,NODE:.spec.nodeName,STATUS:.status.phase,CPU_REQ:.spec.containers[0].resources.requests.cpu,CPU_LIM:.spec.containers[0].resources.limits.cpu,MEM_REQ:.spec.containers[0].resources.requests.memory,MEM_LIM:.spec.containers[0].resources.limits.memory' \
+    2>/dev/null > "$TMP_PODS" || {
+      err "Failed to list pods. Check RBAC (need 'get pods' across all namespaces)."
+      exit 1
+    }
+
+  local TOTAL=0 RUNNING=0
+
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+
+    local NS POD NODE STATUS CPU_REQ CPU_LIM MEM_REQ MEM_LIM
+    NS=$(awk '{print $1}'      <<< "$line")
+    POD=$(awk '{print $2}'     <<< "$line")
+    NODE=$(awk '{print $3}'    <<< "$line")
+    STATUS=$(awk '{print $4}'  <<< "$line")
+    CPU_REQ=$(awk '{print $5}' <<< "$line")
+    CPU_LIM=$(awk '{print $6}' <<< "$line")
+    MEM_REQ=$(awk '{print $7}' <<< "$line")
+    MEM_LIM=$(awk '{print $8}' <<< "$line")
+
+    [[ "$NODE"    == "<none>" || -z "$NODE"    ]] && NODE="<pending>"
+    [[ "$CPU_REQ" == "<none>" || -z "$CPU_REQ" ]] && CPU_REQ="<none>"
+    [[ "$CPU_LIM" == "<none>" || -z "$CPU_LIM" ]] && CPU_LIM="<none>"
+    [[ "$MEM_REQ" == "<none>" || -z "$MEM_REQ" ]] && MEM_REQ="<none>"
+    [[ "$MEM_LIM" == "<none>" || -z "$MEM_LIM" ]] && MEM_LIM="<none>"
+
+    local CPU_USAGE MEM_USAGE
+    read -r CPU_USAGE MEM_USAGE <<< "$(get_usage "$NS" "$POD")"
+
+    local OWNER_TYPE
+    OWNER_TYPE=$(get_owner_type "$NS" "$POD")
+
+    TOTAL=$((TOTAL + 1))
+    [[ "$STATUS" == "Running" ]] && RUNNING=$((RUNNING + 1))
+
+    # Colour STATUS
+    local STATUS_CLR
+    case "$STATUS" in
+      Running)                       STATUS_CLR="${GREEN}${STATUS}${RESET}" ;;
+      Pending)                       STATUS_CLR="${YELLOW}${STATUS}${RESET}" ;;
+      Failed|CrashLoopBackOff|Error) STATUS_CLR="${RED}${STATUS}${RESET}" ;;
+      *)                             STATUS_CLR="$STATUS" ;;
+    esac
+
+    local TYPE_CLR
+    TYPE_CLR=$(type_colour "$OWNER_TYPE")
+
+    # Terminal
+    printf "${FMT}\n" \
+      "$NS" "$POD" "$TYPE_CLR" "$NODE" "$STATUS_CLR" \
+      "$CPU_REQ" "$CPU_LIM" "$MEM_REQ" "$MEM_LIM" \
+      "$CPU_USAGE" "$MEM_USAGE"
+
+    # Plain TXT
+    printf "$FMT\n" \
+      "$NS" "$POD" "$OWNER_TYPE" "$NODE" "$STATUS" \
+      "$CPU_REQ" "$CPU_LIM" "$MEM_REQ" "$MEM_LIM" \
+      "$CPU_USAGE" "$MEM_USAGE" >> "$TXT_FILE"
+
+    # CSV
+    echo "${NS},${POD},${OWNER_TYPE},${NODE},${STATUS},${CPU_REQ},${CPU_LIM},${MEM_REQ},${MEM_LIM},${CPU_USAGE},${MEM_USAGE}" \
+      >> "$CSV_RESOURCES"
+
+  done < "$TMP_PODS"
+
+  echo -e "${BOLD}${SEP}${RESET}"
+  echo -e "  ${BOLD}Total pods: ${TOTAL}${RESET}  |  ${GREEN}Running: ${RUNNING}${RESET}  |  ${YELLOW}Other: $((TOTAL - RUNNING))${RESET}"
+  echo "$SEP"                                                            >> "$TXT_FILE"
+  echo "  Total pods: ${TOTAL}  |  Running: ${RUNNING}  |  Other: $((TOTAL - RUNNING))" >> "$TXT_FILE"
+  echo ""
+}
+
+# ============================================================
+#  STEP 6 — Workload Type Report (Pod → Namespace → Type)
+# ============================================================
+generate_workload_type_report() {
+  section "POD WORKLOAD TYPE REPORT  (Pod | Namespace | Type)"
+
+  echo "NAMESPACE,POD_NAME,TYPE" > "$CSV_WORKLOADS"
+
+  local FMT='%-30s %-55s %-15s'
+  local SEP; SEP=$(printf '%.0s-' {1..103})
+  local HEADER
+  HEADER=$(printf "$FMT" 'NAMESPACE' 'POD NAME' 'TYPE')
+
+  echo -e "${BOLD}${HEADER}${RESET}"
+  echo -e "${BOLD}${SEP}${RESET}"
+  echo "$HEADER" >> "$TXT_FILE"
+  echo "$SEP"    >> "$TXT_FILE"
+
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    local NS POD TYPE
+    NS=$(awk   '{print $1}' <<< "$line")
+    POD=$(awk  '{print $2}' <<< "$line")
+    TYPE=$(awk '{print $3}' <<< "$line")
+
+    local TYPE_CLR
+    TYPE_CLR=$(type_colour "$TYPE")
+
+    printf "${FMT}\n" "$NS" "$POD" "$TYPE_CLR"
+    printf "${FMT}\n" "$NS" "$POD" "$TYPE"     >> "$TXT_FILE"
+    echo "${NS},${POD},${TYPE}"                >> "$CSV_WORKLOADS"
+
+  done < "$TMP_POD_OWNER"
+
+  echo -e "${BOLD}${SEP}${RESET}"
+  echo "$SEP" >> "$TXT_FILE"
+  echo ""
+}
+
+# ============================================================
+#  STEP 7 — Deployment List (all namespaces)
+# ============================================================
+generate_deployment_report() {
+  section "DEPLOYMENTS  (all namespaces)"
+
+  echo "NAMESPACE,DEPLOYMENT,READY,UP-TO-DATE,AVAILABLE,AGE" >> "$CSV_WORKLOADS"
+
+  kubectl get deployments --all-namespaces --no-headers \
+    -o custom-columns=\
+'NS:.metadata.namespace,NAME:.metadata.name,READY:.status.readyReplicas,DESIRED:.spec.replicas,UPDATED:.status.updatedReplicas,AVAILABLE:.status.availableReplicas,AGE:.metadata.creationTimestamp' \
+    2>/dev/null > "$TMP_DEPLOY" || warn "Could not list deployments."
+
+  local FMT='%-28s %-45s %-8s %-10s %-10s %-10s %-25s'
+  local SEP; SEP=$(printf '%.0s-' {1..140})
+  local HEADER
+  HEADER=$(printf "$FMT" 'NAMESPACE' 'DEPLOYMENT NAME' 'READY' 'DESIRED' 'UPDATED' 'AVAILABLE' 'CREATED AT')
+
+  echo -e "${BOLD}${HEADER}${RESET}"
+  echo -e "${BOLD}${SEP}${RESET}"
+  echo "$HEADER" >> "$TXT_FILE"
+  echo "$SEP"    >> "$TXT_FILE"
+
+  local COUNT=0
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    COUNT=$((COUNT + 1))
+
+    local NS NAME READY DESIRED UPDATED AVAIL AGE
+    NS=$(awk      '{print $1}' <<< "$line")
+    NAME=$(awk    '{print $2}' <<< "$line")
+    READY=$(awk   '{print $3}' <<< "$line")
+    DESIRED=$(awk '{print $4}' <<< "$line")
+    UPDATED=$(awk '{print $5}' <<< "$line")
+    AVAIL=$(awk   '{print $6}' <<< "$line")
+    AGE=$(awk     '{print $7}' <<< "$line")
+
+    [[ "$READY"   == "<none>" || -z "$READY"   ]] && READY="0"
+    [[ "$DESIRED" == "<none>" || -z "$DESIRED" ]] && DESIRED="0"
+    [[ "$UPDATED" == "<none>" || -z "$UPDATED" ]] && UPDATED="0"
+    [[ "$AVAIL"   == "<none>" || -z "$AVAIL"   ]] && AVAIL="0"
+
+    # Colour READY vs DESIRED
+    local READY_CLR
+    if [[ "$READY" == "$DESIRED" ]]; then
+      READY_CLR="${GREEN}${READY}${RESET}"
+    else
+      READY_CLR="${RED}${READY}${RESET}"
+    fi
+
+    printf "${FMT}\n" "$NS" "$NAME" "$READY_CLR" "$DESIRED" "$UPDATED" "$AVAIL" "$AGE"
+    printf "${FMT}\n" "$NS" "$NAME" "$READY"      "$DESIRED" "$UPDATED" "$AVAIL" "$AGE" >> "$TXT_FILE"
+    echo "${NS},${NAME},${READY}/${DESIRED},${UPDATED},${AVAIL},${AGE}" >> "$CSV_WORKLOADS"
+
+  done < "$TMP_DEPLOY"
+
+  echo -e "${BOLD}${SEP}${RESET}"
+  echo -e "  ${BOLD}Total Deployments: ${COUNT}${RESET}"
+  echo "$SEP"                            >> "$TXT_FILE"
+  echo "  Total Deployments: ${COUNT}"  >> "$TXT_FILE"
+  echo ""
+}
+
+# ============================================================
+#  STEP 8 — ReplicaSet List (all namespaces)
+# ============================================================
+generate_replicaset_report() {
+  section "REPLICASETS  (all namespaces)"
+
+  echo "NAMESPACE,REPLICASET,DESIRED,CURRENT,READY,OWNER_DEPLOYMENT,AGE" >> "$CSV_WORKLOADS"
+
+  kubectl get replicasets --all-namespaces --no-headers \
+    -o custom-columns=\
+'NS:.metadata.namespace,NAME:.metadata.name,DESIRED:.spec.replicas,CURRENT:.status.replicas,READY:.status.readyReplicas,OWNER:.metadata.ownerReferences[0].name,AGE:.metadata.creationTimestamp' \
+    2>/dev/null > "$TMP_RS" || warn "Could not list ReplicaSets."
+
+  local FMT='%-28s %-55s %-9s %-9s %-7s %-40s %-25s'
+  local SEP; SEP=$(printf '%.0s-' {1..180})
+  local HEADER
+  HEADER=$(printf "$FMT" 'NAMESPACE' 'REPLICASET NAME' 'DESIRED' 'CURRENT' 'READY' 'OWNER DEPLOYMENT' 'CREATED AT')
+
+  echo -e "${BOLD}${HEADER}${RESET}"
+  echo -e "${BOLD}${SEP}${RESET}"
+  echo "$HEADER" >> "$TXT_FILE"
+  echo "$SEP"    >> "$TXT_FILE"
+
+  local COUNT=0
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    COUNT=$((COUNT + 1))
+
+    local NS NAME DESIRED CURRENT READY OWNER AGE
+    NS=$(awk      '{print $1}' <<< "$line")
+    NAME=$(awk    '{print $2}' <<< "$line")
+    DESIRED=$(awk '{print $3}' <<< "$line")
+    CURRENT=$(awk '{print $4}' <<< "$line")
+    READY=$(awk   '{print $5}' <<< "$line")
+    OWNER=$(awk   '{print $6}' <<< "$line")
+    AGE=$(awk     '{print $7}' <<< "$line")
+
+    [[ "$DESIRED" == "<none>" || -z "$DESIRED" ]] && DESIRED="0"
+    [[ "$CURRENT" == "<none>" || -z "$CURRENT" ]] && CURRENT="0"
+    [[ "$READY"   == "<none>" || -z "$READY"   ]] && READY="0"
+    [[ "$OWNER"   == "<none>" || -z "$OWNER"   ]] && OWNER="(standalone)"
+
+    local READY_CLR
+    if [[ "$READY" == "$DESIRED" ]]; then
+      READY_CLR="${GREEN}${READY}${RESET}"
+    else
+      READY_CLR="${YELLOW}${READY}${RESET}"
+    fi
+
+    printf "${FMT}\n" "$NS" "$NAME" "$DESIRED" "$CURRENT" "$READY_CLR" "$OWNER" "$AGE"
+    printf "${FMT}\n" "$NS" "$NAME" "$DESIRED" "$CURRENT" "$READY"     "$OWNER" "$AGE" >> "$TXT_FILE"
+    echo "${NS},${NAME},${DESIRED},${CURRENT},${READY},${OWNER},${AGE}" >> "$CSV_WORKLOADS"
+
+  done < "$TMP_RS"
+
+  echo -e "${BOLD}${SEP}${RESET}"
+  echo -e "  ${BOLD}Total ReplicaSets: ${COUNT}${RESET}"
+  echo "$SEP"                           >> "$TXT_FILE"
+  echo "  Total ReplicaSets: ${COUNT}" >> "$TXT_FILE"
+  echo ""
+}
+
+# ============================================================
+#  STEP 9 — StatefulSet List (all namespaces)
+# ============================================================
+generate_statefulset_report() {
+  section "STATEFULSETS  (all namespaces)"
+
+  echo "NAMESPACE,STATEFULSET,READY,DESIRED,SERVICE_NAME,AGE" >> "$CSV_WORKLOADS"
+
+  kubectl get statefulsets --all-namespaces --no-headers \
+    -o custom-columns=\
+'NS:.metadata.namespace,NAME:.metadata.name,READY:.status.readyReplicas,DESIRED:.spec.replicas,SVC:.spec.serviceName,AGE:.metadata.creationTimestamp' \
+    2>/dev/null > "$TMP_STS" || warn "Could not list StatefulSets."
+
+  local FMT='%-28s %-45s %-8s %-9s %-35s %-25s'
+  local SEP; SEP=$(printf '%.0s-' {1..158})
+  local HEADER
+  HEADER=$(printf "$FMT" 'NAMESPACE' 'STATEFULSET NAME' 'READY' 'DESIRED' 'SERVICE NAME' 'CREATED AT')
+
+  echo -e "${BOLD}${HEADER}${RESET}"
+  echo -e "${BOLD}${SEP}${RESET}"
+  echo "$HEADER" >> "$TXT_FILE"
+  echo "$SEP"    >> "$TXT_FILE"
+
+  local COUNT=0
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    COUNT=$((COUNT + 1))
+
+    local NS NAME READY DESIRED SVC AGE
+    NS=$(awk      '{print $1}' <<< "$line")
+    NAME=$(awk    '{print $2}' <<< "$line")
+    READY=$(awk   '{print $3}' <<< "$line")
+    DESIRED=$(awk '{print $4}' <<< "$line")
+    SVC=$(awk     '{print $5}' <<< "$line")
+    AGE=$(awk     '{print $6}' <<< "$line")
+
+    [[ "$READY"   == "<none>" || -z "$READY"   ]] && READY="0"
+    [[ "$DESIRED" == "<none>" || -z "$DESIRED" ]] && DESIRED="0"
+    [[ "$SVC"     == "<none>" || -z "$SVC"     ]] && SVC="<none>"
+
+    local READY_CLR
+    if [[ "$READY" == "$DESIRED" ]]; then
+      READY_CLR="${GREEN}${READY}${RESET}"
+    else
+      READY_CLR="${RED}${READY}${RESET}"
+    fi
+
+    printf "${FMT}\n" "$NS" "$NAME" "$READY_CLR" "$DESIRED" "$SVC" "$AGE"
+    printf "${FMT}\n" "$NS" "$NAME" "$READY"      "$DESIRED" "$SVC" "$AGE" >> "$TXT_FILE"
+    echo "${NS},${NAME},${READY},${DESIRED},${SVC},${AGE}" >> "$CSV_WORKLOADS"
+
+  done < "$TMP_STS"
+
+  echo -e "${BOLD}${SEP}${RESET}"
+  echo -e "  ${BOLD}Total StatefulSets: ${COUNT}${RESET}"
+  echo "$SEP"                             >> "$TXT_FILE"
+  echo "  Total StatefulSets: ${COUNT}"  >> "$TXT_FILE"
+  echo ""
+}
+
+# ============================================================
+#  STEP 10 — Per-Namespace Summary
+# ============================================================
+namespace_summary() {
+  section "PER-NAMESPACE SUMMARY"
+
+  printf '%-30s %-8s %-13s %-13s %-13s\n' \
+    'NAMESPACE' 'PODS' 'DEPLOYMENTS' 'REPLICASETS' 'STATEFULSETS'
+  printf '%.0s-' {1..80}; echo ""
+
+  local ALL_NS
+  ALL_NS=$(kubectl get namespaces --no-headers -o custom-columns='NAME:.metadata.name' 2>/dev/null)
+
+  for NS in $ALL_NS; do
+    local PODS DEPLOYS RS STS
+    PODS=$(awk    -v n="$NS" '$1==n' "$TMP_PODS"   2>/dev/null | wc -l | tr -d ' ')
+    DEPLOYS=$(awk -v n="$NS" '$1==n' "$TMP_DEPLOY" 2>/dev/null | wc -l | tr -d ' ')
+    RS=$(awk      -v n="$NS" '$1==n' "$TMP_RS"     2>/dev/null | wc -l | tr -d ' ')
+    STS=$(awk     -v n="$NS" '$1==n' "$TMP_STS"    2>/dev/null | wc -l | tr -d ' ')
+
+    # Only print namespaces that have something
+    if [[ "$PODS" -gt 0 || "$DEPLOYS" -gt 0 || "$RS" -gt 0 || "$STS" -gt 0 ]]; then
+      printf '%-30s %-8s %-13s %-13s %-13s\n' \
+        "$NS" "$PODS" "$DEPLOYS" "$RS" "$STS" \
+        | tee -a "$TXT_FILE"
+    fi
+  done
+  echo ""
+}
+
+# ============================================================
+#  STEP 11 — Footer
+# ============================================================
+print_footer() {
+  local SEP; SEP=$(printf '%.0s═' {1..60})
+  echo ""
+  echo -e "${BOLD}${GREEN}${SEP}${RESET}"
+  echo -e "${BOLD}${GREEN}  REPORT COMPLETE${RESET}"
+  echo -e "${BOLD}${GREEN}${SEP}${RESET}"
+  echo -e "  ${BOLD}Reports saved to:${RESET} ${CYAN}${OUTPUT_DIR}/${RESET}"
+  echo -e ""
+  echo -e "    📄  Full text report  : ${CYAN}${TXT_FILE}${RESET}"
+  echo -e "    📊  Resource CSV      : ${CYAN}${CSV_RESOURCES}${RESET}"
+  echo -e "    📊  Workloads CSV     : ${CYAN}${CSV_WORKLOADS}${RESET}"
+  echo -e "${BOLD}${GREEN}${SEP}${RESET}"
+  echo ""
+}
+
+# ============================================================
+#  BANNER
+# ============================================================
+print_banner() {
+  echo -e "${BOLD}${CYAN}"
+  echo "  ██╗  ██╗ █████╗ ███████╗    ██████╗ ███████╗██████╗  ██████╗ ██████╗ ████████╗"
+  echo "  ██║ ██╔╝██╔══██╗██╔════╝    ██╔══██╗██╔════╝██╔══██╗██╔═══██╗██╔══██╗╚══██╔══╝"
+  echo "  █████╔╝ ╚█████╔╝███████╗    ██████╔╝█████╗  ██████╔╝██║   ██║██████╔╝   ██║   "
+  echo "  ██╔═██╗ ██╔══██╗╚════██║    ██╔══██╗██╔══╝  ██╔═══╝ ██║   ██║██╔══██╗   ██║   "
+  echo "  ██║  ██╗╚█████╔╝███████║    ██║  ██║███████╗██║     ╚██████╔╝██║  ██║   ██║   "
+  echo "  ╚═╝  ╚═╝ ╚════╝ ╚══════╝    ╚═╝  ╚═╝╚══════╝╚═╝      ╚═════╝ ╚═╝  ╚═╝   ╚═╝   "
+  echo -e "${RESET}"
+  echo -e "  ${BOLD}Generates:${RESET} CPU/Memory Allocation · Deployments · ReplicaSets · StatefulSets"
+  echo -e "  ${BOLD}Cluster  :${RESET} ${CYAN}$(kubectl config current-context 2>/dev/null)${RESET}"
+  echo -e "  ${BOLD}Date     :${RESET} $(date)"
+  echo ""
+}
+
+# ============================================================
+#  ENTRY POINT
+# ============================================================
+main() {
+  mkdir -p "$OUTPUT_DIR"
+
+  # Init TXT report header
+  {
+    echo "K8S FULL CLUSTER REPORT"
+    echo "Generated : $(date)"
+    echo "Cluster   : $(kubectl config current-context 2>/dev/null || echo unknown)"
+    echo ""
+  } > "$TXT_FILE"
+
+  print_banner
+  check_prereqs
+  print_node_summary
+  fetch_top_pods
+  build_pod_owner_map
+  generate_resource_report
+  generate_workload_type_report
+  generate_deployment_report
+  generate_replicaset_report
+  generate_statefulset_report
+  namespace_summary
+  print_footer
+}
+
+main "$@"
